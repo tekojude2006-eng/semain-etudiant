@@ -243,10 +243,27 @@ async def creer_inscription(body: InscriptionIn):
 async def changer_statut(numero_ticket: str, body: StatutUpdate):
     if body.statut not in ("pending", "confirmed", "rejected"):
         raise HTTPException(400, "Statut invalide")
-    await run(
-        "UPDATE participants SET statut = $1 WHERE numero_ticket = $2",
-        [body.statut, numero_ticket.upper()], fetch=False
-    )
+    now = datetime.now()
+    # Remplit statut_modifie_par_admin + valide_par_admin si confirmed
+    if body.statut == "confirmed":
+        await run(
+            """UPDATE participants
+               SET statut = $1,
+                   statut_modifie_par_admin = $2,
+                   valide_par_admin = $3
+               WHERE numero_ticket = $4""",
+            [body.statut, str(now), str(now), numero_ticket.upper()],
+            fetch=False
+        )
+    else:
+        await run(
+            """UPDATE participants
+               SET statut = $1,
+                   statut_modifie_par_admin = $2
+               WHERE numero_ticket = $3""",
+            [body.statut, str(now), numero_ticket.upper()],
+            fetch=False
+        )
     rows = await run("SELECT * FROM participants WHERE numero_ticket = $1", [numero_ticket.upper()])
     if not rows:
         raise HTTPException(404, "Ticket introuvable")
@@ -287,7 +304,14 @@ async def valider_entree(numero_ticket: str):
         return {"succes": False, "code": "PENDING", "message": "Paiement non confirmé"}
     if p["utilise"]:
         return {"succes": False, "code": "ALREADY_USED", "message": "Ticket déjà utilisé"}
-    await run("UPDATE participants SET utilise = TRUE, utilise_le = $1 WHERE numero_ticket = $2",[datetime.now(), numero_ticket.upper()], fetch=False)
+    now = datetime.now()
+    await run(
+        """UPDATE participants
+           SET utilise = TRUE,
+               utilise_le = $1
+           WHERE numero_ticket = $2""",
+        [now, numero_ticket.upper()], fetch=False
+    )
     return {"succes": True, "code": "OK", "message": "Entrée validée", "nom": f"{p.get('prenom','')} {p.get('nom','')}".strip(), "ticket": p["numero_ticket"], "type": p["type_ticket"], "montant": float(p.get("montant") or 0)}
 
 
