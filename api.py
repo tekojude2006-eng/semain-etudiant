@@ -33,24 +33,40 @@ DB_PORT     = int(os.getenv("DB_PORT", "5432"))
 NUMERO_PAIEMENT = "90548682"
 
 # ══════════════════════════════════════
-#  CONNEXION
+#  POOL DE CONNEXIONS (au lieu d'une connexion par requête)
 # ══════════════════════════════════════
-async def get_conn():
-    return await asyncpg.connect(
-        host=DB_HOST, port=DB_PORT, database=DB_NAME,
-        user=DB_USER, password=DB_PASSWORD, ssl="require"
+pool: asyncpg.Pool = None
+
+@app.on_event("startup")
+async def startup():
+    global pool
+    pool = await asyncpg.create_pool(
+        host=DB_HOST,
+        port=DB_PORT,
+        database=DB_NAME,
+        user=DB_USER,
+        password=DB_PASSWORD,
+        ssl="require",
+        min_size=2,
+        max_size=10,
+        command_timeout=30,
     )
+    print("✅ Pool de connexions DB créé")
+
+@app.on_event("shutdown")
+async def shutdown():
+    global pool
+    if pool:
+        await pool.close()
 
 async def run(sql: str, params=None, fetch=True):
-    conn = await get_conn()
-    try:
+    global pool
+    async with pool.acquire() as conn:
         if fetch:
             rows = await conn.fetch(sql, *(params or []))
             return [dict(r) for r in rows]
         else:
             await conn.execute(sql, *(params or []))
-    finally:
-        await conn.close()
 
 # ══════════════════════════════════════
 #  HELPERS
@@ -97,7 +113,6 @@ def fmt_evenement(row: dict) -> dict:
 #  SCHEMAS
 # ══════════════════════════════════════
 class InscriptionIn(BaseModel):
-    # Champs envoyés par le HTML
     nom:              str
     prenom:           str
     telephone:        str
@@ -105,11 +120,10 @@ class InscriptionIn(BaseModel):
     origine:          str
     est_interne:      bool
     type_ticket:      str            = "semaine"
-    evenement_id:     Optional[str]  = None   # soiree_id du HTML
+    evenement_id:     Optional[str]  = None
     operateur:        str            = "Mix by Yas (Moov)"
     code_transaction: str
     montant:          float
-    # Champs optionnels envoyés par le HTML (ignorés côté API)
     numero_ticket:    Optional[str]  = None
     soiree_id:        Optional[str]  = None
     soiree_titre:     Optional[str]  = None
@@ -156,8 +170,13 @@ def root():
     return {"app": "WEEK25 API", "status": "en ligne"}
 
 @app.get("/health")
-def health():
-    return {"status": "ok"}
+async def health():
+    # Vérifie que le pool est vivant
+    try:
+        await run("SELECT 1")
+        return {"status": "ok", "db": "connected"}
+    except Exception as e:
+        raise HTTPException(500, f"DB error: {str(e)}")
 
 # ══════════════════════════════════════
 #  INSCRIPTIONS
@@ -219,7 +238,6 @@ async def get_inscription(numero_ticket: str):
 
 @app.post("/api/inscriptions", status_code=201)
 async def creer_inscription(body: InscriptionIn):
-    # Utilise soiree_id si evenement_id absent
     evt_id = body.evenement_id or body.soiree_id or None
     ticket = await generer_ticket(body.type_ticket)
     await run(
@@ -244,7 +262,6 @@ async def changer_statut(numero_ticket: str, body: StatutUpdate):
     if body.statut not in ("pending", "confirmed", "rejected"):
         raise HTTPException(400, "Statut invalide")
     now = datetime.now()
-    # Remplit statut_modifie_par_admin + valide_par_admin si confirmed
     if body.statut == "confirmed":
         await run(
             """UPDATE participants
@@ -267,6 +284,21 @@ async def changer_statut(numero_ticket: str, body: StatutUpdate):
     rows = await run("SELECT * FROM participants WHERE numero_ticket = $1", [numero_ticket.upper()])
     if not rows:
         raise HTTPException(404, "Ticket introuvable")
+    return fmt(rows[0])
+
+
+@app.patch("/api/inscriptions/{numero_ticket}/utiliser")
+async def utiliser_ticket(numero_ticket: str):
+    """Marque un ticket comme utilisé (entrée validée)"""
+    rows = await run("SELECT * FROM participants WHERE numero_ticket = $1", [numero_ticket.upper()])
+    if not rows:
+        raise HTTPException(404, "Ticket introuvable")
+    now = datetime.now()
+    await run(
+        "UPDATE participants SET utilise = TRUE, utilise_le = $1 WHERE numero_ticket = $2",
+        [now, numero_ticket.upper()], fetch=False
+    )
+    rows = await run("SELECT * FROM participants WHERE numero_ticket = $1", [numero_ticket.upper()])
     return fmt(rows[0])
 
 
@@ -306,10 +338,7 @@ async def valider_entree(numero_ticket: str):
         return {"succes": False, "code": "ALREADY_USED", "message": "Ticket déjà utilisé"}
     now = datetime.now()
     await run(
-        """UPDATE participants
-           SET utilise = TRUE,
-               utilise_le = $1
-           WHERE numero_ticket = $2""",
+        "UPDATE participants SET utilise = TRUE, utilise_le = $1 WHERE numero_ticket = $2",
         [now, numero_ticket.upper()], fetch=False
     )
     return {"succes": True, "code": "OK", "message": "Entrée validée", "nom": f"{p.get('prenom','')} {p.get('nom','')}".strip(), "ticket": p["numero_ticket"], "type": p["type_ticket"], "montant": float(p.get("montant") or 0)}
